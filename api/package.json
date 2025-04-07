@@ -1,0 +1,22 @@
+{
+  "name": "geoapi-fastify",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "ts-node-dev --respawn src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@fastify/swagger": "^8.0.0",
+    "@fastify/swagger-ui": "^1.8.0",
+    "dotenv": "^16.0.3",
+    "fastify": "^4.0.0",
+    "pg": "^8.11.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.9.0",
+    "@types/pg": "^8.11.11",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.2.2"
+  }
+}

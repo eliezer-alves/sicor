@@ -1,0 +1,9 @@
+# Ignorar pasta node_modules dentro de api/
+api/node_modules/
+
+# Ignorar pastas de input
+input/
+input2/
+
+# Ignorar pasta kml
+kml/

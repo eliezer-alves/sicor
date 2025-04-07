@@ -1,0 +1,48 @@
+version: "3.3"
+
+services:
+  api:
+    build:
+      context: ./api
+    container_name: geoapi-server
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+    environment:
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: geoapi
+    restart: unless-stopped
+
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: postgis-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: geoapi
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  importer:
+    build: .
+    depends_on:
+      - db
+    environment:
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: geoapi
+    volumes:
+      - ./input:/app/input
+    command: ["python", "import_all_glebas_fast.py"]
+
+volumes:
+  pgdata:
