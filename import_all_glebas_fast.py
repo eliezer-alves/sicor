@@ -1,158 +1,225 @@
 import os
 import re
-import pandas as pd
+import sys
+import time
+from pathlib import Path
+from typing import Optional, Tuple
+
 import psycopg2
-from psycopg2 import sql
-from shapely import wkt as shapely_wkt
-from shapely.errors import ShapelyError
 
-# Configurações do banco
-DB_USER = "postgres"
-DB_PASS = "postgres"
-DB_HOST = "db"
-DB_PORT = "5432"
-DB_NAME = "geoapi"
 
-INPUT_DIR = "input"
+# ---------------------------
+# Config
+# ---------------------------
+INPUT_DIR = Path(os.getenv("INPUT_DIR", "input"))
+SCHEMA_SQL_PATH = Path(os.getenv("SCHEMA_SQL_PATH", "schema.sql"))
 
-def extract_year_from_filename(filename):
-    match = re.search(r"(\d{4})", filename)
-    return int(match.group(1)) if match else None
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASS", "postgres")
+DB_HOST = os.getenv("DB_HOST", "db")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "geoapi")
 
-def copy_to_staging(csv_path, year, conn):
-    # 🔄 Limpa staging antes de cada importação
-    clear_staging(conn)
-    print(f"\n📂 Processando: {csv_path}")
-    print(f"📅 Ano extraído: {year}")
-    
-    df = pd.read_csv(csv_path, sep=';', dtype=str)
-    print(f"🧾 Linhas no CSV: {len(df)}")
-    print(f"🧠 Colunas antes do rename: {df.columns.tolist()}")
+# Performance flags
+ANALYZE_AFTER_EACH_FILE = os.getenv("ANALYZE_AFTER_EACH_FILE", "true").lower() == "true"
+TRUNCATE_STAGING_EACH_FILE = os.getenv("TRUNCATE_STAGING_EACH_FILE", "true").lower() == "true"
 
-    try:
-        df.rename(columns={
-            "REF_BACEN": "ref_bacen",
-            "NU_ORDEM": "order_number",
-            "NU_INDICE": "index_number",
-            "GT_GEOMETRIA": "wkt"
-        }, inplace=True)
 
-        df["year"] = year
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
-        # 🔍 Validação dos WKTs com Shapely
-        valid_rows = []
-        invalid_count = 0
-        for _, row in df.iterrows():
-            try:
-                _ = shapely_wkt.loads(row["wkt"])
-                valid_rows.append(row)
-            except ShapelyError:
-                invalid_count += 1
 
-        df = pd.DataFrame(valid_rows)
-        print(f"🧪 Geometrias válidas: {len(df)}")
-        print(f"⚠️ Geometrias descartadas por WKT inválido: {invalid_count}")
+def extract_year_from_filename(filename: str) -> Optional[int]:
+    """
+    Extrai um ano (YYYY) do nome do arquivo.
+    Ex.: glebas_2022.csv -> 2022
+    """
+    m = re.search(r"(19\d{2}|20\d{2})", filename)
+    return int(m.group(1)) if m else None
 
-        temp_csv = "/tmp/temp_glebas.csv"
-        df[["ref_bacen", "order_number", "index_number", "wkt", "year"]].to_csv(temp_csv, index=False, header=False)
 
-        print("📤 Exportando para CSV temporário... OK")
-
-        with conn.cursor() as cur, open(temp_csv, 'r') as f:
-            cur.copy_expert(
-                sql.SQL("COPY glebas_staging (ref_bacen, order_number, index_number, wkt, year) FROM STDIN WITH (FORMAT CSV)"),
-                f
-            )
-        conn.commit()
-        print(f"✅ Dados copiados para staging ({len(df)} linhas).")
-    
-    except Exception as e:
-        print(f"❌ Erro durante importação: {e}")
-
-def process_staging(conn):
-    print("⚙️ Processando dados da staging para a tabela final...")
-    print("🔍 Aplicando filtro ST_IsValid() nas geometrias...")
-
-    with conn.cursor() as cur:
-        # Mostra quantas inválidas o PostGIS rejeitaria
-        cur.execute("""
-            SELECT COUNT(*) 
-            FROM glebas_staging 
-            WHERE NOT ST_IsValid(ST_GeomFromText(wkt, 4326));
-        """)
-        invalid_count = cur.fetchone()[0]
-        print(f"⚠️ Geometrias inválidas no PostGIS: {invalid_count}")
-
-        # Usando CTE para evitar que ST_GeomFromText quebre
-        cur.execute("""
-            WITH valid_geoms AS (
-                SELECT
-                    ref_bacen,
-                    order_number,
-                    index_number,
-                    year,
-                    wkt,
-                    ST_GeomFromText(wkt, 4326) AS geom
-                FROM glebas_staging
-                WHERE ST_IsValid(ST_GeomFromText(wkt, 4326))
-            )
-            INSERT INTO glebas (
-                ref_bacen,
-                order_number,
-                index_number,
-                year,
-                wkt,
-                geom,
-                kml,
-                geojson
-            )
-            SELECT
-                ref_bacen,
-                order_number,
-                index_number,
-                year,
-                wkt,
-                geom,
-                ST_AsKML(geom),
-                json_build_object(
-                    'type', 'Feature',
-                    'geometry', ST_AsGeoJSON(geom)::json,
-                    'properties', json_build_object(
-                        'ref_bacen', ref_bacen,
-                        'order_number', order_number,
-                        'index_number', index_number,
-                        'year', year
-                    )
-                )
-            FROM valid_geoms;
-        """)
-        conn.commit()
-
-    print("🏁 Dados processados e inseridos na tabela final.")
-
-def clear_staging(conn):
-    with conn.cursor() as cur:
-        cur.execute("TRUNCATE glebas_staging;")
-        conn.commit()
-
-def main():
-    print("🧠 Iniciando importação de arquivos...")
-    conn = psycopg2.connect(
-        dbname=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT
+def connect():
+    return psycopg2.connect(
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        host=DB_HOST,
+        port=DB_PORT,
     )
 
-    for filename in os.listdir(INPUT_DIR):
-        if filename.endswith(".csv"):
-            year = extract_year_from_filename(filename)
-            if year:
-                file_path = os.path.join(INPUT_DIR, filename)
-                copy_to_staging(file_path, year, conn)
-                process_staging(conn)
-            else:
-                print(f"⚠️ Ignorando arquivo sem ano no nome: {filename}")
-    
-    conn.close()
-    print("🎉 Importação completa!")
+
+def ensure_schema(conn) -> None:
+    if not SCHEMA_SQL_PATH.exists():
+        raise FileNotFoundError(f"schema.sql não encontrado em: {SCHEMA_SQL_PATH.resolve()}")
+
+    sql_text = SCHEMA_SQL_PATH.read_text(encoding="utf-8")
+    with conn.cursor() as cur:
+        cur.execute(sql_text)
+    conn.commit()
+    log(f"Schema aplicado a partir de {SCHEMA_SQL_PATH}")
+
+
+def copy_csv_to_staging(conn, csv_path: Path, year: int) -> int:
+    """
+    Faz COPY do CSV original direto para staging.
+    Retorna quantidade estimada de linhas carregadas (nem sempre disponível com precisão no COPY).
+    """
+    with conn.cursor() as cur:
+        if TRUNCATE_STAGING_EACH_FILE:
+            cur.execute("TRUNCATE glebas_staging;")
+
+        # COPY: arquivo tem HEADER e delimiter ';'
+        copy_cmd = """
+            COPY glebas_staging (ref_bacen, order_number, index_number, wkt)
+            FROM STDIN
+            WITH (FORMAT CSV, HEADER TRUE, DELIMITER ';')
+        """
+
+        # Arquivos podem ter sujeira de encoding; errors=replace evita crash
+        with csv_path.open("r", encoding="utf-8", errors="replace") as f:
+            cur.copy_expert(copy_cmd, f)
+
+        # set year para o lote atual
+        cur.execute("UPDATE glebas_staging SET year = %s WHERE year IS NULL;", (year,))
+
+        # Contagem do lote (custo baixo, mas existe; pode desligar se quiser)
+        cur.execute("SELECT COUNT(*) FROM glebas_staging;")
+        (count_rows,) = cur.fetchone()
+        return int(count_rows)
+
+
+def process_staging_set_based(conn) -> Tuple[int, int]:
+    """
+    Processa staging -> final em SQL set-based:
+      - Converte WKT -> geom
+      - Separa inválidos e registra em glebas_rejected
+      - Insere válidos em glebas (ON CONFLICT DO NOTHING)
+    Retorna (inserted_valid, inserted_rejected) da execução.
+    """
+    sql_process = """
+    WITH parsed AS (
+      SELECT
+        ref_bacen,
+        order_number,
+        index_number,
+        year,
+        wkt,
+        ST_Force2D(ST_GeomFromText(wkt, 4326)) AS geom
+      FROM glebas_staging
+    ),
+    invalid AS (
+      SELECT
+        ref_bacen,
+        order_number,
+        index_number,
+        year,
+        wkt,
+        CASE
+          WHEN geom IS NULL THEN 'geom is NULL (parse failed)'
+          ELSE ST_IsValidReason(geom)
+        END AS reason
+      FROM parsed
+      WHERE geom IS NULL OR NOT ST_IsValid(geom)
+    ),
+    valid AS (
+      SELECT
+        ref_bacen,
+        order_number,
+        index_number,
+        year,
+        wkt,
+        geom
+      FROM parsed
+      WHERE geom IS NOT NULL AND ST_IsValid(geom)
+    ),
+    ins_valid AS (
+      INSERT INTO glebas (ref_bacen, order_number, index_number, year, wkt, geom)
+      SELECT ref_bacen, order_number, index_number, year, wkt, geom
+      FROM valid
+      ON CONFLICT (ref_bacen, order_number, index_number, year) DO NOTHING
+      RETURNING 1
+    ),
+    ins_rej AS (
+      INSERT INTO glebas_rejected (ref_bacen, order_number, index_number, year, wkt, reason)
+      SELECT ref_bacen, order_number, index_number, year, wkt, reason
+      FROM invalid
+      RETURNING 1
+    )
+    SELECT
+      (SELECT COUNT(*) FROM ins_valid)   AS inserted_valid,
+      (SELECT COUNT(*) FROM ins_rej)     AS inserted_rejected;
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql_process)
+        inserted_valid, inserted_rejected = cur.fetchone()
+        return int(inserted_valid), int(inserted_rejected)
+
+
+def analyze_tables(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("ANALYZE glebas;")
+        cur.execute("ANALYZE glebas_rejected;")
+    conn.commit()
+
+
+def main() -> int:
+    if not INPUT_DIR.exists():
+        log(f"Diretório de input não existe: {INPUT_DIR.resolve()}")
+        return 1
+
+    csv_files = sorted([p for p in INPUT_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".csv"])
+    if not csv_files:
+        log(f"Nenhum .csv encontrado em: {INPUT_DIR.resolve()}")
+        return 0
+
+    log(f"Conectando no Postgres: host={DB_HOST} db={DB_NAME} user={DB_USER}")
+    conn = connect()
+    conn.autocommit = False
+
+    try:
+        ensure_schema(conn)
+
+        for csv_path in csv_files:
+            year = extract_year_from_filename(csv_path.name)
+            if not year:
+                log(f"[SKIP] Arquivo sem ano no nome: {csv_path.name}")
+                continue
+
+            log(f"\n=== Importando: {csv_path.name} (year={year}) ===")
+            t0 = time.time()
+
+            try:
+                # 1) COPY para staging
+                staging_count = copy_csv_to_staging(conn, csv_path, year)
+
+                # 2) Processamento set-based
+                inserted_valid, inserted_rejected = process_staging_set_based(conn)
+
+                conn.commit()
+
+                t1 = time.time()
+                log(
+                    f"OK: staging={staging_count} | inserted_valid={inserted_valid} | "
+                    f"rejected={inserted_rejected} | elapsed={t1 - t0:.2f}s"
+                )
+
+                if ANALYZE_AFTER_EACH_FILE:
+                    analyze_tables(conn)
+                    log("ANALYZE executado.")
+
+            except Exception as e:
+                conn.rollback()
+                log(f"[ERRO] Falha importando {csv_path.name}: {e}")
+                # Se quiser interromper ao primeiro erro:
+                return 2
+
+        log("\nImport finalizado com sucesso.")
+        return 0
+
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

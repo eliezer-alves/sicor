@@ -1,4 +1,4 @@
-version: "3.3"
+version: "3.8"
 
 services:
   api:
@@ -6,7 +6,8 @@ services:
       context: ./api
     container_name: geoapi-server
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     ports:
       - "3000:3000"
     environment:
@@ -28,21 +29,37 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./data:/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d geoapi"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
   importer:
-    build: .
+    build:
+      context: .
+    container_name: geoapi-importer
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     environment:
       DB_USER: postgres
       DB_PASS: postgres
       DB_HOST: db
       DB_PORT: 5432
       DB_NAME: geoapi
+      INPUT_DIR: /app/input
+      SCHEMA_SQL_PATH: /app/schema.sql
+      ANALYZE_AFTER_EACH_FILE: "true"
     volumes:
       - ./input:/app/input
-    command: ["python", "import_all_glebas_fast.py"]
+      - ./schema.sql:/app/schema.sql:ro
+    # Não roda nada por padrão
+    command: ["tail", "-f", "/dev/null"]
+    restart: "no"
 
 volumes:
   pgdata:
